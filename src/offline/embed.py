@@ -113,3 +113,194 @@ def _count_rows(path:Path) ->int:
     if last_byte and last_byte != b'\n':
         total += 1
     return total
+
+def _progress_path(out_path:Path) -> Path:
+    """
+       由产物路径推出进度文件路径:xxx.vec.npy -> xxx.vec.npy.progress.json
+
+       参数:out_path: Path —— 向量产物路径(通常是 data/vectors/*.vec.npy)
+       返回:Path —— 进度文件路径
+
+       实现原理:
+           用 Path(...) 包回去,而不是字符串拼接后忘了转 Path。
+           刻意【不用】 out_path.with_suffix():那样会把 .vec.npy 的最后一个
+           后缀替换掉,变成 xxx.progress.json,和 .npy 产物同名冲突风险更高。
+       """
+    return Path(str(out_path) + _PROGRESS_SUFFIX)
+
+def _load_progress(out_path:Path,total:int,dim:int,batch_size:int) -> int:
+    """
+        读取断点续跑的位置:返回从第几行开始继续。
+
+        实现原理:
+            续跑点的可信前提是"这次的运行参数和上次完全一样"。只要 total / dim /
+            batch_size 有任何一个对不上,上次写到第 k 行的含义就变了(比如批大小从 64
+            改成 32,虽然行边界不受影响,但为省纠纷一律作废重来)。
+            所以这里采取"严格校验 + 宽松降级":校验不过就返回 0,宁可重跑也不冒险错位。
+
+        调用的外部方法:
+            Path.exists() / Path.read_text() / json.loads()
+
+        参数:
+            out_path:    Path —— 向量产物(进度文件由它推出来)
+            total:       int  —— 本次计划写入的总行数
+            dim:         int  —— 本次的向量维度
+            batch_size:  int  —— 本次的批大小
+
+        返回:int —— 已完成的 rows_done(0 表示从头跑)
+
+        明确不做:
+            不做"部分有效"的推断 —— 中间状态一律作废,因为猜错一次的代价是整个矩阵错位。
+        """
+    p = _progress_path(out_path)
+    if not p.exists():
+        return 0
+    try:
+        info = json.loads(p.read_text(encoding='utf-8'))
+    except Exception as e:
+        logger.warning(f"进度文件损坏({e}),本次从第0行重跑")
+        return 0
+    if info.get('total') != total or info.get('dim') != dim or info.get('batch_size') != batch_size:
+        logger.warning(f"进度文件与本次参数不匹配(上次total=%s/dim=%s/batch=%s)",
+                       info.get('total'),info.get('dim'),info.get('batch_size'))
+        return 0
+    rows_done = int(info.get('rows_done',0))
+    return max(0,min(rows_done,total))
+
+def _save_progress(out_path:Path,rows_done:int,total:int,dim:int,batch_size:int) -> None:
+    """
+        原子地记录"已经写完多少行"(断点续跑的关键)。
+
+        实现原理(为什么必须"先写临时文件再 rename"):
+            如果直接 open(p,'w') 写,job 在写到一半时被 Ctrl+C / 断电终止,
+            磁盘上会留下半截 JSON;下次启动 json.loads 直接抛错,断点信息全丢。
+            先写 .tmp 再 os.replace() 是 POSIX 保证的原子操作:
+            目标文件要么保持旧内容、要么整个换成新内容,绝不会出现中间态。
+
+        调用的外部方法:
+            json.dumps(obj, ensure_ascii=False) —— 写 UTF-8 明文,便于人手查看
+            Path.write_text / os.replace(src, dst) —— Windows/POSIX 都原子
+
+        参数:
+            out_path:   Path —— 向量产物路径(进度文件由它推出来)
+            rows_done:  int  —— 当前已写入且已 flush 的行数
+            total/dim/batch_size: 本次运行参数,下次续跑时用来校验一致性
+
+        返回:None
+        """
+    p = _progress_path(out_path)
+    tmp = Path(str(p) + '.tmp')
+    info = {
+        'rows_done':rows_done,
+        'total':total,
+        'dim':dim,
+        'batch_size':batch_size
+    }
+    tmp.write_text(json.dumps(info,ensure_ascii=False) + '\n',encoding='utf-8')
+    os.replace(tmp,p)
+
+def _post_batch(texts:list[str]) -> np.ndarray:
+    """
+        第 1 层核心:把"一批"文本交给 Ollama,返回原始向量(未归一化)。
+
+        实现原理:
+            一次 HTTP POST 带多条文本,由 Ollama 内部组织成一次 GPU batch:
+            模型权重只要读一遍显存就能被这批数据复用,摊薄了 kernel launch 与访存开销
+            (就是 batch=1 比 batch=64 慢一个量级的原因)。
+            失败按 2 / 4 / 8 秒指数退避重试:网络抖动几百毫秒自愈,
+            而"模型被别的进程挤出显存"恢复得更久,指数退避能用最小的总等待覆盖两种场景。
+
+        调用的外部方法:
+            _get_session().post(url, json=..., timeout=...):
+                requests.Session.post —— 发 POST;json= 参数自动序列化 dict 并带 Content-Type
+                timeout 是从"发请求"到"收完响应"的总时长上限。首次调用要把 1.2GB 模型
+                  加载进显存(几十秒),所以给 300 秒(config.EMBED_TIMEOUT)。
+            r.raise_for_status():4xx/5xx 抛 requests.HTTPError —— 200 不代表内容对
+            r.json():解析响应体; 必须放在 try 里(见下方"其它注意事项")
+            np.asarray(rows, dtype=np.float32):
+                Python 浮点默认是 float64,不显式写 dtype 会得到 float64 矩阵
+                ——体积翻倍(全量 20GB)且 faiss 的 add() 拒收。
+
+        参数:
+            texts: list[str] —— 一批文本,长度应 <= batch_size(本函数自身不再分批)
+
+        返回:np.ndarray,形状 (len(texts), config.EMBED_DIM),dtype=float32(未归一化)
+
+        明确不做:
+            不做归一化 —— 那是 _l2_normalize 的职责,分层是为了让各自可独立测试。
+
+        其它注意事项:
+            1)  行数校验是整个离线作业最重要的一行防御。若服务端少返回一行,
+               np.vstack 会安静地少拼一行,于是矩阵从第 i 行起整体错位,
+               要等到 D4 的 sanity_check 才发现,而那时已经白跑了几小时。
+            2) Ollama 的 embeddings 顺序与 input 顺序一致 —— 这是服务端的契约;
+               上面那条行数校验就是防止它(或代理层)违反这条契约。
+        """
+    payload = {'model':config.EMBED_MODEL,'input':texts}
+    last = None
+    for attmpt in range(config.EMBED_MAX_RETRIES + 1):      #range(N+1):第0次是正常请求，后面N次是重试，合计N+1次机会
+        try:
+            r = _get_session().post(
+                f"{config.OLLAMA_URL}/api/embed",
+                json=payload,
+                timeout=config.EMBED_TIMEOUT,
+            )
+            r.raise_for_status()        #4xx/5xx 在这里变成异常状态，执行下面的except
+            rows = r.json()['embeddings']
+            if len(rows) != len(texts):
+                raise ValueError(f"OLLAMA返回{len(rows)}行，期望{len(texts)}行")
+            return np.asarray(rows,dtype=np.float32)
+        except Exception as e:
+            #统一兜住三种异常：requests 网络异常 / HTTPError / .json()解析失败/行数不符
+            # 它们都适合重试，因为都可能是服务暂时不可用
+            last = e
+            if attmpt < config.EMBED_MAX_RETRIES:
+                time.sleep(config.EMBED_RETRY_SLEEP * (2 ** attmpt))  # 2/4/8秒
+                logger.warning('embed 第 %d 次失败:%s,等待后重试',attmpt + 1,e)
+    # 所以机会用完，绝不吞掉错误，让上层作业停下来，而不是跳过继续写入embed
+    raise RuntimeError(f"embedd批次失败(已重试{config.EMBED_MAX_RETRIES}次):{last}")
+
+def _l2_normalize(vecs:np.ndarray) -> np.ndarray:
+    """
+        第 1 层核心:逐行 L2 归一化,让每行向量的模长 = 1。
+
+        实现原理:
+            余弦相似度 cos(θ) = (A·B) / (|A| × |B|)。
+            当 |A| = |B| = 1 时,分母恒为 1,于是 cos(θ) = A·B,也就是【内积(IP)】。
+            D4 选的是 faiss.IndexFlatIP(暴力算内积),所以:
+                归一化之后,faiss 返回的分数直接就是余弦相似度,可跨查询比较、可设阈值;
+                不归一化,测出来的量混进了"向量长度",长句会被无理由地排到前面,
+                而且【不报错、不崩溃】,只是悄悄变差 —— 这就是"静默降级"。
+            架构 P5「防御性归一化」的含义:实测 Ollama 的 bge-m3 通常已返回单位向量,
+            但我们仍显式做一遍,因为这条契约依赖后端实现,换服务就可能不成立。
+
+        调用的外部方法:
+            np.ascontiguousarray(x, dtype):
+                ① dtype=float32 —— faiss.add() 只收 float32,且全量用 float64 会占 20GB;
+                ② C 连续 —— faiss 按 C 语言内存布局直接读这块缓冲区。
+                若已是 float32 且连续,它【返回同一个对象】(不拷贝)。
+            np.linalg.norm(x, axis=1, keepdims=True):
+                按行求欧氏范数,keepdims=True 使结果形状为 (N,1) 而不是 (N,)。
+                  keepdims 不能省:(N,1024) / (N,) 会按最后一个维度广播而炸掉,
+                  只有 (N,1) 才能正确地"逐行除"。
+            np.maximum(norms, _EPS):
+                兜零向量:0/0 会产出 nan,而 nan 一旦写进 FAISS,整库检索结果全废。
+
+        参数:
+            vecs: np.ndarray —— (N, EMBED_DIM) 的原始向量矩阵
+
+        返回:np.ndarray —— 同形状的归一化矩阵(float32、C 连续)
+
+        注意:
+            当入参已是 float32+连续时,本函数会【就地修改】入参(vecs /= norms 是原地运算)。
+            调用方若需要保留原值,请先传副本。
+        """
+    # 两步合成一行，转类型 + 保证连续（两个约束都有这一个调用满足）
+    vecs = np.ascontiguousarray(vecs,dtype=np.float32)
+    #（N + 1）:keepdims = True 才能按正确的轴广播
+    norms = np.linalg.norm(vecs,axis=1,keepdims=True)
+    # 0行 superior -> 设置 1e-12，避免除以0，得到nan
+    norms = np.maximum(norms,_EPS)
+    vecs /= norms
+    return vecs
+

@@ -19,6 +19,10 @@ DATA_ARTICLES = PROJECT_ROOT / "data" / "articles"          # 二次清洗分片
 ARTICLES_FILE = DATA_ARTICLES / "wiki_zh.jsonl"             # D1 全量合并产物,本模块的输入
 CHUNKS_FILE = DATA_CHUNKS / "wiki_chunks.jsonl"             # 全量切片产物
 CHUNKS_SUBSET_FILE = DATA_CHUNKS / "wiki_chunks_subset.jsonl"  # 调试子集(前 10 万篇)
+# ---- 向量产物(D3 落盘,中间产物;建完索引即可删除重建)----
+DATA_VECTORS = PROJECT_ROOT / "data" / "vectors"                   # 向量矩阵目录
+VECTORS_FILE = DATA_VECTORS / "wiki_chunks.vec.npy"                # 全量
+VECTORS_SUBSET_FILE = DATA_VECTORS / "wiki_chunks_subset.vec.npy"  # 调试子集
 
 # ---- 切片参数(D2 定稿:450~550 弹性区间,完整性优先于精确 500)----
 CHUNK_MIN_CHARS = 450       # 下限:当前块不足此数时必须继续加句(允许暂时突破上限)
@@ -33,6 +37,9 @@ OLLAMA_URL = "http://localhost:11434"
 EMBED_MODEL = "bge-m3"
 EMBED_DIM = 1024          # bge-m3 输出维度;换模型必须同步改,且索引需重建
 EMBED_TIMEOUT = 300       # 首次调用需把模型加载进显存,给足余量
+EMBED_BATCH_SIZE = 64     # 一次 POST 带多少条文本(D3 实测调优,见 D3开发指引.md §3.4 与验收 V7)
+EMBED_MAX_RETRIES = 3     # 单批失败最多重试几次(网络抖动 / Ollama 重启)
+EMBED_RETRY_SLEEP = 2.0   # 重试前的基础等待秒数(指数退避:2 / 4 / 8)
 
 
 # ---- Qwen 生成 ----
