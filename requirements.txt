@@ -1,0 +1,19 @@
+# RAG from scratch — Python 3.12
+# 架构:Ollama(bge-m3 向量) + faiss-cpu(检索) + Qwen API(生成)
+# 好消息:向量模型由 Ollama 服务化提供,Python 侧不再需要 torch / sentence-transformers
+# (注意:若日后要加 cross-encoder 重排器,Ollama 不支持,届时再单独引入 torch)
+
+# faiss-cpu: 上游从 1.10 起停止发布 macOS 轮子(只剩 sdist,需 cmake+swig 源码编译),
+#   macOS(Intel/Apple Silicon)最高可用 1.9.0;其他平台不受限制。
+faiss-cpu>=1.8,<1.10; sys_platform == "darwin"
+faiss-cpu>=1.8; sys_platform != "darwin"
+numpy>=1.26,<2.0        # 锁 <2.0,防 faiss-cpu DLL 冲突
+requests>=2.31          # 调 Ollama REST API(/api/embed)
+dashscope>=1.20
+tiktoken>=0.7
+jieba>=0.42
+wikiextractor>=3.0.6    # 仅支持到 Python 3.12(cgi 模块 3.13 被移除)
+datasets>=2.20
+tqdm>=4.66
+python-dotenv>=1.0
+pytest>=8.0             # 测试框架(pytest.ini 的 pythonpath= 需要 >=7.0)
