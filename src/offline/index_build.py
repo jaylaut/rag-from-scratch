@@ -1,59 +1,134 @@
 # -*- coding: utf-8 -*-
 """D4 - index_build.py:建 FAISS 索引(离线流水线终点)
 
-职责(自底向上四层):
-    第 1 层  _fmt_bytes / _default_paths / _infer_rows / _open_vectors / _audit_vectors /
-             _new_index / _add_shards / _write_index / _iter_meta_rows / _write_meta /
-             _count_rows / _read_index / _verify_alignment
-             原子能力:路径解析、memmap 打开、向量体检、索引构建与落盘、元数据落盘、对齐校验
-    第 2 层  build_index / build_subset_index / build_full_index
-             主流程编排 + 两套产物(subset / full)的一层壳
-    第 3 层  _sample_row_ids / _fetch_meta_rows / _embed_query / sanity_check
-             建库自检:库内已有 chunk 重新 embed → 检索 → top1 必须是自己
-    第 4 层  __main__
-             命令行入口(--full / --limit N / --no-sanity / --no-verify / --k / --n)
+================================================================================
+一句话职责
+================================================================================
+把 D3 产出的"向量矩阵"(只有数字)和 D2 产出的"切片文件"(只有文本),
+变成两份能被在线检索直接加载的产物:
+    ① index/*.faiss          —— FAISS 索引,只存向量数字
+    ② index/chunks_meta.jsonl —— 元数据,存文本与溯源字段
 
-全模块唯一的约束:FAISS 第 i 行向量 ↔ chunks_meta.jsonl 第 i 行 ↔ chunks 文件第 i 行。
-   三者一旦错位,检索会把"A 的向量"配上"B 的文本",而且【不报错】——典型的静默降级。
+================================================================================
+本模块唯一的铁律:行序 1:1(看懂这一条,就看懂了半个模块)
+================================================================================
+FAISS 第 i 行向量  ↔  chunks_meta.jsonl 第 i 行  ↔  chunks 文件第 i 行。
 
-对应:路线计划 D4 | 架构 §3.5 / §5 | 开发指引 D4建索引开发指引.md
-运行:python -m offline.index_build                (建 subset 索引,默认带自检)
-     python -m offline.index_build --full         (D7 全量)
-     python -m offline.index_build --limit 2000   (只取前 2000 行,秒级冒烟)
+这两份产物之间【唯一】的关联就是"行号"。一旦错位:
+    不报错、不崩溃,只会把 "A 的向量" 配上 "B 的文本"
+    → 答案张冠李戴,是最难查的一类线上故障。
+由此推出四条硬性禁令:
+    1. 不许排序   —— FAISS 的向量编号就是 add() 的先后顺序,顺序即主键
+    2. 不许去重   —— 相邻块有 50~100 字重叠,重复是设计的一部分,不是脏数据
+    3. 不许跳行   —— 行数对不上就 raise,绝不能"取较小值悄悄截断"
+    4. 不许改 text —— meta 里的 text 一个字符都不许动(与 D2/D3 同一条铁律)
+
+================================================================================
+分层设计(四层,自底向上,调用方向自上而下)
+================================================================================
+第 1 层(原子能力,不涉及流程决策,可独立测试):
+    _fmt_bytes / _default_paths / _infer_rows / _open_vectors / _audit_vectors
+    _new_index / _add_shards / _write_index
+    _iter_meta_rows / _write_meta / _count_rows / _read_index / _verify_alignment
+第 2 层(编排 + 两套产物的一层壳):
+    build_index / build_subset_index / build_full_index
+第 3 层(建库自检,唯一需要 Ollama 的部分,刻意与建库主流程隔开):
+    _sample_row_ids / _fetch_meta_rows / _embed_query / sanity_check
+第 4 层(命令行入口):
+    _read_args / __main__
+
+================================================================================
+★ 签名口径统一说明(照抄 D4指引 §5.14 的说明)
+================================================================================
+占位文件原来写的是 build_index(vectors: np.ndarray, meta_source),
+路线计划写的是 build_index(vectors_path, chunks_path, index_dir)。
+本模块统一为【传路径】:整份向量矩阵(设计上限档约 4 GB)
+不可能整体当函数参数传,必须走"路径 + memmap"。
+
+================================================================================
+运行方式(macOS,先激活 venv,再 cd src)
+================================================================================
+python -m offline.index_build                 建 subset 索引(默认,带自检)
+python -m offline.index_build --full          建全量索引(D7 用)
+python -m offline.index_build --limit 2000    只取前 2000 行(秒级冒烟)
+python -m offline.index_build --limit=2000    同上(等号写法也必须认)
+python -m offline.index_build --no-sanity     跳过自检(Ollama 未起 / D3 未完成时)
+python -m offline.index_build --no-verify     跳过落盘后的回读校验(不建议)
+python -m offline.index_build --k 10 --n 5    自检时取 top-10、抽 5 个样本
 """
-import json
-import logging
-import random
-import sys
-import time
-from pathlib import Path
-from typing import Iterator
+import json      # 标准库:把 dict 序列化成 JSON 字符串(json.dumps),写 meta 用
+import logging   # 标准库:打日志。注意 basicConfig 只能在 __main__ 里配,见文件末尾
+import random    # 标准库:自检时抽行号(random.Random().sample),不想为抽 3 个整数引入 numpy
+import sys       # 标准库:sys.argv 读命令行参数;sys.exit(1) 让脚本能带失败码退出
+import time      # 标准库:time.perf_counter() 高精度计时,统计各阶段耗时
+from pathlib import Path      # 标准库:面向对象的路径对象,比字符串拼路径安全(跨 Windows/Mac)
+from typing import Iterator   # 标准库:类型注解用,标明 _iter_meta_rows 是"生成器"
 
-import faiss                # faiss-cpu:索引的构建/罗盘/检索全靠它
-import numpy as np
+import faiss                # 第三方:faiss-cpu。索引的创建/写入/读取/检索全靠它
+import numpy as np          # 第三方:向量矩阵的唯一载体(memmap / ascontiguousarray / norm 等)
 
-from common import config
-from common.utils import iter_jsonl   #jsonl 流式读
+from common import config           # 项目内:全部路径与参数常量的单一事实来源
+from common.utils import iter_jsonl # 项目内:JSONL 逐行流式读的生成器(内存 O(1))
 
 # 模块级 logger
 logger = logging.getLogger(__name__)
 
-_ADD_SHARD = 200_000        # 每次index.add()行数，20万行 * 1024 * 4B = 800MB
-_META_WRITE_BATCH = 10_000      # 元数据凑足1万行，才真正写盘
-_META_HEARTBEAT = 200_000        # 元数据每次写满20万行，输入一条进度日志
+#   每次 index.add() 喂多少行向量。
+#   一行 = 1024 维 × 4 字节 = 4 KB,5 万行 ≈ 200 MB。
+_ADD_SHARD = 50_000
+
+#   元数据攒够多少行才真正写一次盘。
+#   原因:一行一写是 20 万次函数调用("写"这个动作本身的开销被放大 20 万倍),
+#   攒成 1 万行一批后,写次数降到 20 次左右。
+_META_WRITE_BATCH = 10_000
+
+# 元数据每次写满20万行，输入一条进度日志
+_META_HEARTBEAT = 200_000
+
+#   入库前随机抽多少行做"向量体检"(见 _audit_vectors)。
+#   200 行 × 1024 维 × 4 字节 ≈ 800 KB,读进内存毫无压力。
 _AUDIT_SAMPLES = 200            # 入库前，随机抽200行做 向量检查
-_NORM_TOL = 1e-3                # 范数容差
-_ZERO_TOL = 1e-6                # 判定 ‘零向量’的范数下限
+
+#   范数(向量长度)容差。
+#   为什么是 1e-3 这么松:float32 下归一化后每行模长的严格值是 1 ± 1e-7,
+#   这里放宽到 1e-3 只为抓住"压根没归一化"这种【量级】错误,不是卡精度。
+_NORM_TOL = 1e-3
+
+#   判定"零向量"的范数下限:模长小于它就算全零行。
+_ZERO_TOL = 1e-6
+
+#   自检时"自己检索自己"的余弦相似度下限(见 sanity_check)。
+#   归一化后,同一段文本再次编码,自己跟自己的余弦应当 ≈ 1.0。
 _MIN_SELF_SCORE = 0.999         # 自检：自己检索自己的余弦下限
-_SEED = 42                      # 固定随机种子
+
+#   固定随机种子。架构原则 P4「一切可复现」:固定种子 → 每次抽到同一批行号
+_SEED = 42
 
 
 def _fmt_bytes(n: float) -> str:
-    '''
-    把字节数转换成实际容易理解的字符串，例如：1024 -> 1kb
-    参数 n : 字节数 (允许传float 或者 int)
-    返回 ： 例如 '812.23MB'
-    '''
+    """把字节数变成人能读的字符串。
+
+    ===========================================================================
+    功能
+    ===========================================================================
+    838860800 → "0.8 GiB",而不是让人去数有几个零。
+
+    ===========================================================================
+    实现原理
+    ===========================================================================
+    循环除以 1024,直到数值落在 [0, 1024) 区间内,就用当前单位输出。
+    刻意保留一位小数:监控体积变化时,需要能看出"增量"而不只是量级。
+     是 1024 进制不是 1000 进制:磁盘/内存的行业习惯就是 1024,
+      用 KiB/MiB/GiB 这套写法本身就是在提醒读者"这是 1024 进制"。
+
+    参数:
+        n: float | int —— 字节数(允许 float,因为调用方常拿估算值来调)
+    返回:
+        str —— 例如 "78.1 MiB" / "0.8 GiB"
+    明确不做:
+        不做 SI 单位(1000 进制的 KB/MB/GB)。
+    """
+
 
     # 转成浮点数，避免后面小数丢失
     v = float(n)
@@ -70,26 +145,33 @@ def _fmt_bytes(n: float) -> str:
     return f"{v:.1f} PiB"
 
 def _default_paths(full: bool = False) -> tuple[Path,Path,Path,Path]:
-    '''
-    一次给出"四件套"路径:(向量文件, 切片文件, 索引文件, 元数据文件)。
+    """按"全量 / 调试子集"一次给出 (向量, 切片, 索引, 元数据) 四件套路径。
 
-    为什么要把四个路径绑成一个函数返回?
-        因为这四个必须【成套使用】。如果拿全量的向量去配子集的 chunks,
-        行数立刻对不上。所以设计上就不允许调用方一个一个拼,要么整套走默认,
-        要么自己在 build_index 里整套覆盖。
+        ===========================================================================
+        实现原理
+        ===========================================================================
+        四件套必须【成套】使用:拿全量的向量配子集的 chunks,行数立刻对不上。
+        所以设计上不允许调用方一个一个拼路径 —— 要么整套走默认,要么整套覆盖。
+        两套产物的名字必须不同:否则 D7 一次全量建库就把调试产物冲掉了(反之亦然)。
 
-    两套的含义:
-        full=True  → 全量:整个开发流程验证无误后，全量跑,索引约 9.35 GiB
-        full=False → 调试子集:开发期全程用这个,秒级/分钟级，节省时间
+        调用的外部对象(config.py 里的常量,全是 pathlib.Path):
+            config.VECTORS_FILE        D3 全量向量产物(中间产物)
+            config.VECTORS_SUBSET_FILE D3 调试子集向量产物
+            config.CHUNKS_FILE         D2 全量切片产物
+            config.CHUNKS_SUBSET_FILE  D2 调试子集切片产物
+            config.INDEX_FILE          本模块全量索引产物(交付物)
+            config.META_FILE           本模块全量元数据产物(交付物)
+            config.INDEX_SUBSET_FILE   本模块调试子集索引产物
+            config.META_SUBSET_FILE    本模块调试子集元数据产物
 
-    参数:
-        full: True 用全量四件套,False 用调试子集四件套(默认 False,防止手滑跑全量)
-    返回:
-        四元组 (vectors_path, chunks_path, index_path, meta_path)
-
-    明确不做:
-        不检查文件是否存在 —— 那是 build_index 开头的事("先检查、后打开")。
-    '''
+        参数:
+            full: bool —— True 取全量四件套;False(默认)取调试子集四件套。
+                  默认 False 是故意的:防止手滑跑了全量。
+        返回:
+            tuple —— (vectors_path, chunks_path, index_path, meta_path)
+        明确不做:
+            不检查文件是否存在 —— 那是 build_index 开头"先检查后开"的职责。
+        """
     if full:
         return (
             config.VECTORS_FILE,
@@ -105,33 +187,36 @@ def _default_paths(full: bool = False) -> tuple[Path,Path,Path,Path]:
     )
 
 def _infer_rows(vectors_path: Path, dim: int,expect_rows:int | None = None) -> int:
-    '''
-    推断(或校验)向量矩阵到底有多少行 —— 【本模块最容易写错的一处】。
+    """推断(或【校验】)向量矩阵有多少行 —— 本模块防止"维度配错"的唯一防线。
 
-    ────────────────────────────────────────────────────────────────────
-    原理讲解:为什么不能简单地用 "文件大小 ÷ 每行字节数" 来算行数
-    ────────────────────────────────────────────────────────────────────
-    错误写法是:行数 = 文件大小 / (dim × 4)。实际这种并不准确
-    举个具体反例:假设文件是 3,072,000 字节 ——
-        · 按 dim=768 解读: 3,072,000 / (768×4) = 1000 行  ，没问题
-        · 按 dim=1024 解读: 3,072,000 / (1024×4) = 750 行  ，没问题
-    看起来合理，如果换了 embedding 模型(比如换成 768 维的)
-    却忘了改 config.EMBED_DIM,程序不会报错,它仍会建出一个维度错误的索引。
+        ===========================================================================
+        ★ 实现原理(本模块最值钱的一处设计,见 D4指引 §3.6)
+        ===========================================================================
+        朴素写法:"行数 = 文件字节数 ÷ (dim × 4)"。但它是【猜】:
+            3,072,000 字节 = 1000 行 × 768 维 × 4B
+                           =  750 行 × 1024 维 × 4B   ← 两种解释都整除!
+        换模型后 config.EMBED_DIM 忘了从 1024 改成 768,这个猜法会
+        静默建出一个形状错误的索引 —— 能写完、能检索、能出结果,只是【全错】。
 
-    所以本函数的策略是分两条路:
-        · 给了 expect_rows → 它是实际(来自 chunks 文件数出来的行数),
-          用它当答案,并且反过来断言 "文件字节数必须 == rows × dim × 4",
-          对不上立刻 raise,把隐患变成当场报错;
-        · 没给 expect_rows → 才退化成整除推断(只在单测/手工调用时走这条路)。
+        正确做法:行数的权威来自 chunks 文件(它是事实),拿到行数后
+        反过来【断言】向量文件字节数必须 == rows × dim × 4,对不上立刻 raise。
+        这就是把"静默错误"换成"当场报错"。
 
-    参数:
-        vectors_path: 向量文件路径
-        dim:          向量维度(应当等于 config.EMBED_DIM)
-        expect_rows:  期望行数;None 未确认
+        调用的外部方法:
+            Path.stat().st_size —— 取文件元信息里的字节数,【不打开文件、不读内容】
 
-    返回:int —— 行数
-    抛出:ValueError —— 文件为空 / 字节数对不上 / 与 expect_rows 矛盾
-    '''
+        参数:
+            vectors_path: Path —— 向量文件路径
+            dim:          int  —— 向量维度,应当等于 config.EMBED_DIM(维度即契约)
+            expect_rows:  int | None —— 期望行数(来自 chunks 文件数出来的行数);
+                          None 表示未知,只走"退化推断"分支(仅单测/手工调用会走)
+        返回:
+            int —— 行数
+        抛出:
+            ValueError —— 文件为空 / 字节数对不上 / 与 expect_rows 矛盾
+        明确不做:
+            不打开文件、不读内容、不做任何"取整兼容"(差一个字节就是错)。
+        """
     #stat() 读取文件的元信息(不打开文件内容),st_size 就是字节数
     size = vectors_path.stat().st_size
 
@@ -385,13 +470,236 @@ def _add_shards(index: 'faiss.Index',vecs: np.memmap,shard: int=_ADD_SHARD) ->di
         'shards':n_shard,
     }
 
+def _write_index(index: 'faiss.Index',index_path: Path) -> dict:
+    """把索引写进 index/*.faiss,并记录体积与耗时。
+
+        ===========================================================================
+        实现原理
+        ===========================================================================
+        ★ 为什么【不做】"临时文件 + os.replace()" 原子写(D3 的 progress.json 做了):
+            索引文件在设计上限档约 4 GB,写一个临时副本会让磁盘占用【翻倍】。
+            这里的取舍是:直接写 + 写完用 _verify_alignment 回读校验兜底。
+
+        调用的外部函数:
+            Path.parent.mkdir(parents=True, exist_ok=True) —— 建父目录;
+                parents=True 表示连缺的各级父目录一起建;
+                exist_ok=True 表示"已存在也不报错"(幂等,重复跑不会炸)。
+            faiss.write_index(index, fname) —— ★ fname 必须传 str。
+                FAISS 是 C++ 库用 SWIG 封装的,不认 pathlib.Path,传 Path 会抛类型错误。
+            Path.stat().st_size —— 落盘后立刻量一下实际字节数。
+
+        参数:
+            index:      faiss.Index —— 已 add 完的索引
+            index_path: Path        —— 索引文件输出路径
+        返回:
+            dict —— {"index_bytes": 字节数, "write_index_sec": 耗时, "ntotal": 行数}
+        明确不做:
+            不做压缩、不做分片落盘(FAISS 自己就是一个文件)。
+        """
+    index_path.parent.mkdir(parents=True,exist_ok=True)
+    t0 = time.perf_counter()
+    faiss.write_index(index,str(index_path))        #必须使用 str(index_path)
+    sec = index_path.stat().st_size     # 落盘耗时
+    size = index_path.stat().st_size    # 落盘后立即测量实际体积
+    logger.info(
+        '索引已落盘:%s | %s | %d 行 | 耗时 %.1fs',
+        index_path,_fmt_bytes(size),index.ntotal,sec,
+    )
+    return {
+        'index_bytes': size,            # 索引文件字节数
+        'write_index_sec': round(sec,2), # 落盘耗时
+        'ntotal': int(index.ntotal)     # 索引里的向量行数
+    }
+
+def _iter_meta_rows(chunks_path: Path) -> Iterator[dict]:
+    """把索引写进 index/*.faiss,并记录体积与耗时。
+
+        ===========================================================================
+        实现原理
+        ===========================================================================
+        ★ 为什么【不做】"临时文件 + os.replace()" 原子写(D3 的 progress.json 做了):
+            索引文件在设计上限档约 4 GB,写一个临时副本会让磁盘占用【翻倍】。
+            这里的取舍是:直接写 + 写完用 _verify_alignment 回读校验兜底。
+
+        调用的外部函数:
+            Path.parent.mkdir(parents=True, exist_ok=True) —— 建父目录;
+                parents=True 表示连缺的各级父目录一起建;
+                exist_ok=True 表示"已存在也不报错"(幂等,重复跑不会炸)。
+            faiss.write_index(index, fname) —— ★ fname 必须传 str。
+                FAISS 是 C++ 库用 SWIG 封装的,不认 pathlib.Path,传 Path 会抛类型错误。
+            Path.stat().st_size —— 落盘后立刻量一下实际字节数。
+
+        参数:
+            index:      faiss.Index —— 已 add 完的索引
+            index_path: Path        —— 索引文件输出路径
+        返回:
+            dict —— {"index_bytes": 字节数, "write_index_sec": 耗时, "ntotal": 行数}
+        明确不做:
+            不做压缩、不做分片落盘(FAISS 自己就是一个文件)。
+        """
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    #   index/ 目录可能还不存在(首次运行),先建出来
+
+    t0 = time.perf_counter()
+    #   记下开始时刻
+
+    faiss.write_index(index, str(index_path))
+    #   ★ 必须 str(index_path):SWIG 封装不认 Path。这是 FAISS 最常见的坑之一
+
+    sec = time.perf_counter() - t0
+    #   落盘耗时(4 GB 索引用时可达数十秒)
+
+    size = index_path.stat().st_size
+    #   落盘后立刻量实际体积,用于验收 V3 的记录
+
+    logger.info(
+        "索引已落盘:%s | %s | %d 行 | 耗时 %.1fs",
+        index_path, _fmt_bytes(size), index.ntotal, sec,
+    )
+    return {
+        "index_bytes": size,  # 索引文件字节数
+        "write_index_sec": round(sec, 2),  # 落盘耗时
+        "ntotal": int(index.ntotal),  # 索引里的向量行数
+    }
+
+
+def _iter_meta_rows(chunks_path: Path) -> Iterator[dict]:
+    """流式把 chunks 的每一行,变成 meta 的一行(补上 faiss_row)。
+
+    ===========================================================================
+    ★ 实现原理
+    ===========================================================================
+    enumerate 给出的行号就是 FAISS 行号 —— 两者同源,不需要额外映射表。
+    这是"行序 1:1"铁律能成立的【代码层面】根据,不是靠约定。
+
+    为什么缺 chunk_id 必须炸:
+        静默退化成空会让几百万块重名,而后面的行数校验根本查不出来
+        (行数是对的,只是主键没了)。
+
+    调用的外部函数:
+        common.utils.iter_jsonl(path) —— 逐行 json.loads 的生成器:
+            内存 O(1)(不会把几 GB 文件读进来),坏行会带行号抛 ValueError。
+
+    参数:
+        chunks_path: Path —— D2 的切片 JSONL
+    返回(yield):
+        dict —— 一行 meta:{chunk_id, doc_id, title, chunk_index, text, faiss_row}
+
+    """
+    for row,obj in enumerate(iter_jsonl(chunks_path)):  #iter_jsonl:逐行产出dict,enumerate 同时给出行号，enumerate 默认从0开始 - 这与FAISS的行号起点一致
+        if 'chunk_id' not in obj :          # 住建确实报错,静默退化会造成几百万块重名
+            raise ValueError(
+                # row + 1 习惯从1开始，list(obj)[:5] 把dict的键转成列表，只显示前5个，便于定位问题
+                f"{chunks_path} 第 {row + 1}行缺少 chunk_id字段，字段为{list(obj)[:5]}"
+            )
+
+        #使用yield 而不是 return:这是个【生成器函数】，调用它不会立即执行，而是在for里逐行产出
+        yield {
+            'chunk_id': obj['chunk_id'],            # 主键
+            'doc_id': obj.get('doc_id'),            # .get 取不到时，返回None，不报错
+            'title': obj.get('title') or '',
+            'chunk_index': obj.get('chunk_index'),  # 块在原文内的序号
+            'text': obj.get('text') or '',
+            'faiss_row': row
+        }
+
+def _write_meta(chunks_path: Path,meta_path: Path,expect_rows: int=None) -> dict:
+    """把 chunks 流式改写为 index/chunks_meta.jsonl。
+
+        ===========================================================================
+        实现原理(四条工程约定)
+        ===========================================================================
+        1. newline="\\n" —— 产物统一 LF 换行,别让 Windows 的 CRLF 混进来;
+        2. 攒批写 —— 20 万行一行一写是 20 万次函数调用,攒成 1 万行一批后约 20 次;
+        3. _META_HEARTBEAT 心跳 —— 大档位要跑几分钟,中途不能没动静;
+        4. try/finally: gen.close() —— 生成器内部持着输入文件句柄,
+           ★ 提前 break 时尤其要显式关,不该交给垃圾回收(GC 时机不确定)。
+
+        调用的外部方法:
+            Path.open(mode, encoding, newline) —— 打开文件。
+                mode="w" 写模式(文件已存在会被清空);
+                encoding="utf-8" 指定编码,中文必须显式写;
+                newline="\\n" 强制 LF(否则 Windows 上会写成 \\r\\n)。
+            json.dumps(obj, ensure_ascii=False) —— dict 转 JSON 字符串;
+                ensure_ascii=False 表示【不】把中文转义成 \\uXXXX,
+                写出来的文件人眼能直接看。
+            "\\n".join(buf) —— 用换行符把列表里的字符串连起来(只在行间补换行)。
+
+        参数:
+            chunks_path: Path       —— 输入:D2 的切片 JSONL
+            meta_path:   Path       —— 输出:元数据 JSONL
+            expect_rows: int | None —— 最多写多少行(limit 模式);None 表示全写
+        返回:
+            dict —— {"meta_rows": 行数, "meta_bytes": 字节数, "write_meta_sec": 耗时}
+        明确不做:
+            不排序、不改写字段、不去重。
+        """
+    meta_path.parent.mkdir(parents=True,exist_ok=True)
+    t0 = time.perf_counter()
+    rows = 0            # 已写入的行数计数器
+    buf = []            # 凑足缓冲区:临时存放待写入的json字符串
+    gen = _iter_meta_rows(chunks_path)      # 获取生成器
+    try:
+        # with语句保证离开代码时自动关闭文件句柄，不用手写close()
+        with meta_path.open('w',encoding='utf-8',newline='\n') as fout:
+            for obj in gen:         # 逐行从生成器取dict,内存里一次只有一行
+                buf.append(json.dumps(obj,ensure_ascii=False))     # 转为json字符串，保存到buf里
+                rows += 1    # 行数 +1
+                if len(buf) >= _META_WRITE_BATCH:       # 攒足一万行 -> 真正落盘
+                    fout.write('\n'.join(buf))      # join 只在【行与行之间】补换行
+                    fout.write('\n')                # 行尾再补一个：否则下一批的第一行会粘在上一批最后一行后面
+                    buf.clear()     #清空缓冲区
+
+                if rows % _META_HEARTBEAT == 0:         # 每写满 20 万行打一条心跳日志
+                    logger.info(
+                        '元数据已写 %d 行 | %s | 耗时 %。0fs',
+                        rows,_fmt_bytes(meta_path.stat().st_size,time.perf_counter() -t0,)
+                    )
+
+                if expect_rows is not None and rows >= expect_rows:
+                    # limit 模式：写够了就结束
+                    logger.info('已达上限 %d 行，提前结束(limit 模式)',expect_rows)
+                    break
+            if buf:
+                # 收尾：最后不足一个批量的剩余必须写入，否则最多会丢掉 9999 行
+                fout.write('\n'.join(buf))
+                fout.write('\n')
+    finally:
+        gen.close()   # 显示关闭生成器
+    return {
+        'meta_rows': rows,      # 写入的元数据行数
+        'meta_bytes': meta_path.stat().st_size,         # 产物字节数
+        'write_meta_sec': round(time.perf_counter() - t0,2),    #写 mete的耗时
+    }
+
 
 def _count_rows(path: Path) ->int:
-    '''
-    快速确认一个文本文件有多少行 -- 字节层面，不解析json
-    不解析json是因为json.loads()，250万行就执行250万次 JSON解析。
-    对于确认行数，通过数换行符最快
-    '''
+    """字节级快速数行数(不解析 JSON)。
+
+    ===========================================================================
+    ★ 实现原理
+    ===========================================================================
+    按 1 MiB 二进制块读,直接数块内 b"\\n" 的出现次数,
+    【完全不走 Python 字符串解码】。
+    UTF-8 的多字节序列里不会出现 0x0A 这个字节,所以"数 \\n 字节"
+    严格等于"数行数",不存在误判。
+
+    为什么刻意不用 iter_jsonl:
+        它会对每一行做 json.loads —— 20 万行只为数个数太浪费
+        (D3 的 _count_rows 是同款写法)。
+
+    调用的外部方法:
+        open(path, "rb") —— r=只读,b=二进制模式(不做任何编码解码、不做换行转换)
+        bytes.count(sub) —— C 层实现的子串计数,极快
+        buf[-1:]         —— 取本块最后一个字节(切片写法,拿到的还是 bytes)
+
+    参数:
+        path: Path —— 待数行的文本文件(一般是 .jsonl)
+    返回:
+        int —— 行数(末尾无换行符时补 1;空文件返回 0)
+    明确不做:
+        不做 json.loads、不校验行内容。
+    """
     # 累计统计到的行数
     total = 0
 
@@ -402,14 +710,147 @@ def _count_rows(path: Path) ->int:
     # with ：离开这个代码块时自动关闭文件句柄，无需手写f.close()
     with open(path,'rb') as f:
         while True:
+            buf = f.read(1 << 20) # 每次读1MiB。
+            if not buf:     #读到文件末尾会返回空的bytes -> 空是'假' ->退出循环
+                break
+            total += buf.count(b'\n')       # 累加总字节数
+            last_byte = buf[-1:]  # 记录本块最后一个字节
+
+    if last_byte and last_byte != b'\n':    # 文件非空，且结尾不是换行符 -> 说明最后一行没收尾，要补算1行
+        total += 1
+    return total
+
+def _read_index(index_path: Path) -> tuple:
+    """回读索引,并顺便记下"加载耗时"。
+
+        ===========================================================================
+        实现原理
+        ===========================================================================
+        回读是【唯一能证明落盘产物可用】的动作 —— 只写不读,
+        可能写了个坏文件而毫无察觉。
+        它给出的加载耗时,正是 D6 在线链路首次提问时那 1~2 秒延迟的来源
+        (架构 §4 步骤 0),所以 D6 的 retrieve.load_index 必须做进程内单例缓存;
+        ★ 这里刻意【不缓存】—— 本模块每次都是全新的校验,缓存了就等于没校验。
+
+        调用的外部函数:
+            faiss.read_index(fname) —— ★ 同样只收 str,不认 pathlib.Path
+
+        参数:
+            index_path: Path —— 索引文件路径
+        返回:
+            tuple —— (faiss.Index, float 加载耗时秒)
+        明确不做:
+            不缓存单例、不做 Warm-up 检索。
+        """
+    if not index_path.is_file():
+        raise FileNotFoundError(
+            f"索引文件不存在:{index_path}\n，请先运行index_build.py"
+        )
+    t0 = time.perf_counter()
+
+    index = faiss.read_index(str(index_path))
+    sec = time.perf_counter() - t0
+
+    logger.info(
+        '索引已回读:%s | %d 行 / dim=%d |加载耗时 %.2fs',index_path,index.ntotal,index.d,sec,
+    )
+    return index,round(sec,2)
+
+def _verfify_aligment(index_path: Path,meta_path: Path,expect_rows: int=None) -> dict:
+    """对齐校验:索引向量数 == 元数据行数 == 期望行数。
+
+        ===========================================================================
+        ★ 实现原理(为什么要做这件事)
+        ===========================================================================
+        索引与 meta 是两个独立的文件,它们之间【唯一】的关联是行号。
+        写完各自【独立再数一遍】,是交付前唯一能抓住"错位 / 截断 / 少写"的手段。
+        这类错误在线上表现为"答案张冠李戴" —— 不崩、不报、最难查,
+        所以必须在建库时就堵死。
+
+        代价提示:
+            回读要重新扫一遍向量 —— L 档 0.78 GiB 几乎瞬间,
+            设计上限档 4 GB 需数十秒到一两分钟。所以提供 --no-verify 开关,
+            但【默认开】(省这几十秒不值得赌数据正确性)。
+
+        参数:
+            index_path:  Path       —— 索引文件路径
+            meta_path:   Path       —— 元数据文件路径
+            expect_rows: int | None —— 期望行数;None 表示不校验这一项
+        返回:
+            dict —— {"ntotal", "meta_rows", "load_sec", "aligned"}
+        抛出:
+            RuntimeError —— 三者不一致时,错误信息里直接给出处理办法
+        明确不做:
+            不校验字段内容(那是验收脚本的事,不是本函数的职责)。
+        """
+
+    index,load_sec = _read_index(index_path)        # 回读索引，顺便拿到加载耗时
+    ntotal = int(index.ntotal)      # 索引里的向量行数
+    meta_rows = _count_rows(meta_path)  # 元数据行数
+
+    #两个条件同时满足才算通过：
+    # 索引行数 == 元数据行数   且    期望行数 == 索引行数
+    ok = (ntotal == meta_rows) and (expect_rows is None or expect_rows == ntotal)
+    if not ok:
+        # 不一致就报错
+        raise RuntimeError(
+            '索引行数与元数据行数不一致，产物不可信(例如索引会把A的向量配上B的文本):\n'
+            f"索引向量数 ntotal = {ntotal}\n"
+            f"元数据行数        = {meta_rows}\n"
+            f"期望行数          ={expect_rows}\n"
+            "处理:删除index/下这两个文件后重跑 index_build.py"
+        )
+    logger.info("对齐校验通过:碎银 %d 行 == 元数据 % 行",ntotal,meta_rows)
+    return {
+        'ntotal': ntotal,           #索引向量行数
+        'meta_rows': meta_rows,     # 元数据行数
+        'load_sec': load_sec,       # 索引加载耗时
+        'aligned': True,
+    }
 
 
+# ===========================================================================
+#                        第 2 层:编排(所有顺序与闸门都在这里)
+# ===========================================================================
+def build_index(vectors_path=None,chunks_path=None,index_path=None,meta_path=None,
+                dim:int = config.EMBED_DIM,expect_rows:int = None,
+                full:bool = False,aduit: bool = True,verify:bool = True) ->dict:
+    """主流程:向量矩阵 + 切片元数据 → FAISS 索引 + 元数据(行序严格 1:1)。
 
-def build_index(vectors: "np.ndarray", meta_source: Path) -> None:
-    """建 IndexFlatIP 并落盘索引 + 元数据。TODO: D4 实现"""
-    raise NotImplementedError
+        ===========================================================================
+        ★ 执行顺序本身就是设计,一步都不能调换
+        ===========================================================================
+        1. 四件套路径解析(None 按 full 取默认)
+        2. ★ 先检查后开 —— 两个输入的存在性检查,必须排在一切写操作之前
+        3. 权威行数来自 chunks,不是从文件大小猜(见 _infer_rows)
+        4. 打开向量矩阵(内部会用权威行数去校验字节数)
+        5. 入库前体检 —— 四道闸门
+        6. 建索引 → 分片 add → 落盘 → 及时释放内存
+        7. 流式写元数据
+        8. 对齐校验
+        9. 返回统计 dict
 
+        为什么步骤 2 的顺序不可调换:
+            _write_index / _write_meta 一旦开始,就等于把上次产物覆盖/清零了;
+            此时才发现输入不存在,一次手滑毁掉上次跑了几小时的结果。
+            (这是 D2 §8「先筛后开」的同款事故。)
 
-def sanity_check(k: int = 5) -> None:
-    """随机抽 3 个已有 chunk 验证 top1 命中自身。TODO: D4 实现"""
-    raise NotImplementedError
+        为什么步骤 6 有 del index:
+            索引在设计上限档常驻约 4 GB,写完就别占着 —— 后面写 meta 要跑几分钟。
+
+        四道闸门(步骤 5)的顺序也有讲究:
+            先查 nan/inf(最致命)→ 零行 → 归一化 → dtype。
+
+        参数:
+            vectors_path / chunks_path / index_path / meta_path: Path | str | None
+                —— 四个路径;传 None 表示用 _default_paths(full) 的默认值
+            dim:         int      —— 向量维度,默认 config.EMBED_DIM(维度即契约)
+            expect_rows: int|None —— 最多处理多少行(limit 模式);None 表示全量
+            full:        bool     —— True 用全量四件套,False 用调试子集四件套
+            audit:       bool     —— 是否做入库前体检(默认 True)
+            verify:      bool     —— 是否做落盘后的回读对齐校验(默认 True)
+        返回:
+            dict —— 统计信息,键见下方 stats
+        明确不做:
+            不调 Ollama(那是 sanity_check 的事);不排序去重;不改 text。
+        """
