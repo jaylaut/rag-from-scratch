@@ -814,7 +814,7 @@ def _verfify_aligment(index_path: Path,meta_path: Path,expect_rows: int=None) ->
 # ===========================================================================
 def build_index(vectors_path=None,chunks_path=None,index_path=None,meta_path=None,
                 dim:int = config.EMBED_DIM,expect_rows:int = None,
-                full:bool = False,aduit: bool = True,verify:bool = True) ->dict:
+                full:bool = False,audit: bool = True,verify:bool = True) ->dict:
     """主流程:向量矩阵 + 切片元数据 → FAISS 索引 + 元数据(行序严格 1:1)。
 
         ===========================================================================
@@ -854,3 +854,99 @@ def build_index(vectors_path=None,chunks_path=None,index_path=None,meta_path=Non
         明确不做:
             不调 Ollama(那是 sanity_check 的事);不排序去重;不改 text。
         """
+    t_start = time.perf_counter()           #计时开始
+    dv,dc,di,dm = _default_paths(full)      # 取出默认四件套：向量、切片、索引、元数据
+    vectors_path = Path(vectors_path) if vectors_path else dv       # 向量输出路径
+    chunks_path = Path(chunks_path) if chunks_path else dc           # 切片输出路径
+    index_path = Path(index_path) if index_path else di             # 索引输出路径
+    meta_path = Path(meta_path) if meta_path else dm                # 元数据输出路径
+
+    logger.info('=' * 70)
+    logger.info("D4 建索引开始 | 模式=%s", "全量" if full else "调试子集")
+    logger.info("  输入① 向量:%s", vectors_path)
+    logger.info("  输入② 切片:%s", chunks_path)
+    logger.info("  输出① 索引:%s", index_path)
+    logger.info("  输出② 元数据:%s", meta_path)
+
+    # 步骤2：校验
+    if not chunks_path.is_file():       # 切片文件不存在
+        raise FileNotFoundError(f"切片文件不存在，{chunks_path}\n请先运行chunk.py")
+
+    if not vectors_path.is_file():      # 向量文件不存在
+        raise FileNotFoundError(f"向量文件不存在:{index_path}\n请先运行embed.py")
+
+    # 步骤3：权威行数来自chunks(既定事实),不是从文件大小猜
+
+    n_chunks = _count_rows(chunks_path)             #字节级快速计算chunks行数
+
+    if n_chunks <= 0:       #chunks是空文件
+        raise ValueError(f"切片文件为空，无法建库:{chunks_path}")
+
+    if expect_rows is None:
+        n_rows = n_chunks       # 没给limit -> 全部行都处理
+    else:
+        # 给了limit -> 取两者较小值：注意这里取较小值来决定处理量，而不是"取较小值截断“，后面 _infer_rows 会用n_rows 去校验字节数，如果不匹配就raise
+        n_rows = min(n_chunks,expect_rows)
+
+    if n_rows <= 0:
+        # 如果limit 传了0 或 负数
+        raise ValueError(f"待处理行数必须为正整数，收到 n_rows = {n_rows}(chunks={n_chunks},expect_rows={expect_rows})")
+    logger.info("权威行数来自 chunks:%d 行(本次处理 %d 行)",n_chunks,n_rows)
+
+    # 步骤4：打开向量矩阵(内部会拿 n_rows 去校验字节数)
+    mm = _open_vectors(vectors_path,dim=dim,expect_rows=n_rows)         # mm 是只读的memmap:结构是(n_rows,dim),dtype=float32
+
+    # 步骤5：入库前校验
+    audit_report = None         # 先置空：如果跳过校验，返回dict里也是这里None
+
+    if audit:
+        audit_report = _audit_vectors(mm)       # 抽样校验
+
+        # 校验1 -> nan/inf : 一旦进库，任何查询的分数都可能变成nan
+        if not audit_report['finite']:
+            raise ValueError(
+                f"向量中出现 nan/inf，禁止入库(抽样{audit_report['sampled']}行):\n 处理:归一化是否产生了 0/0,重跑embedding。"
+            )
+        # 校验2 -> 全零行:断点续跑没跑完时，尾部会留零行
+        if audit_report['zero_rows'] > 0:
+            raise ValueError(f"存在{audit_report['zero_rows']} 个全零行(抽样{audit_report['sampled']} 行:\n)"
+                             "常见原因，在embed过程中终端，矩阵尾部没写。处理：重跑embed或用 --limit 截断。")
+
+        # 校验3 -> 未归一化：内积 ！= 余弦
+        if not audit_report['normalized']:
+            raise ValueError(
+                f"向量未归一化(范数 {audit_report['norm_min']:.6f}~{audit_report['norm_max']:.6f}),"
+                "内积 ≠ 余弦,检索会静默变差:\n"
+                "  处理:检查 embed.py中 的 _l2_normalize 是否生效。"
+            )
+
+        # 校验4 -> dtype:faiss的add()只接收float32的数据
+        if audit_report['dtype'] != 'float32':
+            raise ValueError(f"dtype 必须是 float32，实际为{audit_report['dtype']}")
+    else:
+        logger.warning('已跳过向量校验(audit=False):未归一化/nan/零行都不会被发现')
+
+    # 步骤6：建索引 -> 分片add -> 落盘 -> 释放
+    index = _new_index(dim)         # 创建空的IndexFlatIP
+    add_stats = _add_shards(index,mm)           # 分片把向量添加索引(顺序即编号)
+    write_stats = _write_index(index,index_path)    # 落盘到 index/*.faiss
+    del index       # 主动释放：索引在设计上限档约为4GB常驻内存，后面写meta要跑几分钟，没必要一直占用
+
+    # 步骤7：流式写入元数据
+    meta_stats = _write_meta(chunks_path,meta_path,expect_rows=n_rows)  # 注意传的是 n_rows(不是expect_rows)：limit 模式下要写前 n_rows 行
+
+    # 步骤8：对齐校验
+    if verify:
+        align = _verfify_aligment(index_path,meta_path,expect_rows=n_rows)      # 回读索引 + 数meta 行数，三者必须相等
+    else:
+        logger.warning('已跳过落单后的对齐校验(verify=False) - 产物错位不会被发现')
+        align = {'ntotal': int(add_stats['added']),'meta_rows': int(meta_stats['meta_rows']),
+                 'load_sec': 0.0,'align':False}
+        # 跳过校验时也要把键补全，让返回dict结构一致
+
+    # 步骤9：组装统计 dict
+    elapsed = time.perf_counter() - t_start
+
+
+
+
